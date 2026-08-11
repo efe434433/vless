@@ -1,28 +1,61 @@
-name: Simple Tunnel Test
+name: Xray Docker + Cloudflared
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  tunnel:
     runs-on: ubuntu-latest
+    
     steps:
-    - name: Basit HTTP Server
+    - name: Kurulum
       run: |
-        python3 -m http.server 8000 &
-        sleep 2
+        sudo apt update
+        sudo apt install -y docker.io curl wget
+        sudo systemctl start docker
 
-    - name: Cloudflared
+    - name: Xray Docker Başlat
+      run: |
+        # Xray container'ı başlat
+        docker run -d --name xray --restart=unless-stopped \
+          -p 10000:10000 \
+          -e UUID=$(cat /proc/sys/kernel/random/uuid) \
+          teddysun/xray:latest \
+          xray run -c /etc/xray/config.json
+        
+        sleep 3
+        docker ps
+
+    - name: Cloudflared Kur
       run: |
         wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
         chmod +x cloudflared-linux-amd64
         sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
-        
-        nohup cloudflared tunnel --url http://localhost:8000 > tunnel.log 2>&1 &
+
+    - name: Tunnel Başlat
+      run: |
+        nohup cloudflared tunnel --url http://localhost:10000 > tunnel.log 2>&1 &
         sleep 10
         
         URL=$(grep -o 'https://[a-z0-9]*\.trycloudflare\.com' tunnel.log | head -1)
+        echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
         echo "✅ Tunnel URL: $URL"
-        echo "🌐 Açık: $URL"
+
+    - name: VLESS URL
+      run: |
+        UUID=$(docker exec xray cat /etc/xray/config.json | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+        HOST=$(echo "${{ env.TUNNEL_URL }}" | sed 's|https://||')
+        VLESS="vless://$UUID@$HOST:443?path=/&security=tls&encryption=none&host=$HOST&type=ws#Xray-Docker"
         
+        echo "=========================================="
+        echo "✅ VLESS URL:"
+        echo "$VLESS"
+        echo "=========================================="
+        echo ""
+        echo "QR: https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=$(echo -n "$VLESS" | base64 -w 0)"
+
+    - name: Canlı Tut
+      run: |
+        echo "⏳ Tunnel çalışıyor... (6 saat max)"
+        echo "URL: ${{ env.TUNNEL_URL }}"
         sleep infinity
