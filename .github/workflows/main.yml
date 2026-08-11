@@ -1,0 +1,276 @@
+name: Xray + Cloudflared Tunnel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  xray-tunnel:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Kurulum
+      run: |
+        sudo apt update
+        sudo apt install -y curl wget jq net-tools
+
+    - name: Xray Kurulumu
+      run: |
+        # Xray'i kur
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        
+        # UUID oluştur
+        UUID=$(cat /proc/sys/kernel/random/uuid)
+        echo "UUID=$UUID" >> $GITHUB_ENV
+        echo "✅ UUID: $UUID"
+
+    - name: Xray Config Oluştur
+      run: |
+        UUID="${{ env.UUID }}"
+        
+        # Xray config - VLESS + WS (TLS yok, cloudflared halleder)
+        sudo tee /usr/local/etc/xray/config.json << 'EOF'
+        {
+          "log": {
+            "loglevel": "warning"
+          },
+          "inbounds": [
+            {
+              "port": 10000,
+              "protocol": "vless",
+              "settings": {
+                "clients": [
+                  {
+                    "id": "UUID_DEGISECEK",
+                    "flow": "xtls-rprx-vision"
+                  }
+                ],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                  "path": "/"
+                }
+              }
+            }
+          ],
+          "outbounds": [
+            {
+              "protocol": "freedom",
+              "tag": "direct"
+            },
+            {
+              "protocol": "blackhole",
+              "tag": "block"
+            }
+          ]
+        }
+        EOF
+        
+        # UUID'yi config'e yaz
+        sudo sed -i "s/UUID_DEGISECEK/$UUID/g" /usr/local/etc/xray/config.json
+        
+        # Config'i göster
+        echo "📄 Xray Config:"
+        sudo cat /usr/local/etc/xray/config.json | jq .
+
+    - name: Xray'i Başlat
+      run: |
+        sudo systemctl start xray
+        sudo systemctl enable xray
+        sleep 3
+        
+        # Çalışıyor mu kontrol et
+        sudo systemctl status xray --no-pager
+        sudo netstat -tlnp | grep 10000 || echo "⚠️ Port 10000 dinlenmiyor"
+
+    - name: Cloudflared Kur
+      run: |
+        # Cloudflared indir
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x cloudflared-linux-amd64
+        sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+        cloudflared --version
+
+    - name: Cloudflared Tunnel Başlat
+      id: tunnel
+      run: |
+        # Tunnel'ı başlat
+        nohup cloudflared tunnel --url http://localhost:10000 > tunnel.log 2>&1 &
+        
+        # Cloudflared'ın başlamasını bekle
+        echo "⏳ Cloudflared başlatılıyor..."
+        sleep 10
+        
+        # URL'yi log'dan al
+        TUNNEL_URL=$(grep -o 'https://[a-z0-9]*\.trycloudflare\.com' tunnel.log | head -1)
+        
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "❌ Cloudflared başlatılamadı! Loglar:"
+          cat tunnel.log
+          exit 1
+        fi
+        
+        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+        echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+        echo "✅ Tunnel URL: $TUNNEL_URL"
+
+    - name: VLESS URL Oluştur
+      id: vless
+      run: |
+        UUID="${{ env.UUID }}"
+        TUNNEL_URL="${{ env.TUNNEL_URL }}"
+        
+        # Host'u URL'den çıkar
+        HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
+        
+        # VLESS URL oluştur
+        VLESS_URL="vless://${UUID}@${HOST}:443?path=/&security=tls&encryption=none&host=${HOST}&type=ws#Xray-Tunnel"
+        
+        echo "VLESS_URL=$VLESS_URL" >> $GITHUB_ENV
+        echo "vless_url=$VLESS_URL" >> $GITHUB_OUTPUT
+        
+        # Base64 encode (QR için)
+        ENCODED=$(echo -n "$VLESS_URL" | base64 -w 0)
+        echo "ENCODED=$ENCODED" >> $GITHUB_ENV
+        
+        # Dosyaya kaydet
+        echo "$VLESS_URL" > vless-url.txt
+        echo "$TUNNEL_URL" > tunnel-url.txt
+
+    - name: Client Config Oluştur (v2rayN/Nekoray için)
+      run: |
+        UUID="${{ env.UUID }}"
+        HOST=$(echo "${{ env.TUNNEL_URL }}" | sed 's|https://||')
+        
+        cat << EOF > client-config.json
+        {
+          "outbounds": [
+            {
+              "protocol": "vless",
+              "settings": {
+                "vnext": [
+                  {
+                    "address": "${HOST}",
+                    "port": 443,
+                    "users": [
+                      {
+                        "id": "${UUID}",
+                        "encryption": "none",
+                        "flow": "xtls-rprx-vision"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                  "path": "/"
+                },
+                "security": "tls",
+                "tlsSettings": {
+                  "allowInsecure": false,
+                  "serverName": "${HOST}"
+                }
+              }
+            }
+          ]
+        }
+        EOF
+
+    - name: Sing-box Config Oluştur (Alternatif)
+      run: |
+        UUID="${{ env.UUID }}"
+        HOST=$(echo "${{ env.TUNNEL_URL }}" | sed 's|https://||')
+        
+        cat << EOF > sing-box-config.json
+        {
+          "outbounds": [
+            {
+              "type": "vless",
+              "server": "${HOST}",
+              "server_port": 443,
+              "uuid": "${UUID}",
+              "flow": "xtls-rprx-vision",
+              "tls": {
+                "enabled": true,
+                "server_name": "${HOST}",
+                "insecure": false
+              },
+              "transport": {
+                "type": "ws",
+                "path": "/"
+              }
+            }
+          ]
+        }
+        EOF
+
+    - name: Özet Göster
+      run: |
+        echo "=========================================="
+        echo "✅ XRAY + CLOUDFLARED TUNNEL HAZIR!"
+        echo "=========================================="
+        echo ""
+        echo "🔗 Tunnel URL:"
+        echo "${{ env.TUNNEL_URL }}"
+        echo ""
+        echo "📱 VLESS URL (v2rayN/Nekoray için):"
+        echo "${{ env.VLESS_URL }}"
+        echo ""
+        echo "📱 Base64 (QR Kod için):"
+        echo "${{ env.ENCODED }}"
+        echo ""
+        echo "📱 QR Code Link:"
+        echo "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${{ env.ENCODED }}"
+        echo ""
+        echo "=========================================="
+        echo "📁 Dosyalar:"
+        echo "  - vless-url.txt"
+        echo "  - tunnel-url.txt"
+        echo "  - client-config.json"
+        echo "  - sing-box-config.json"
+        echo "=========================================="
+        echo ""
+        echo "⚠️  NOTLAR:"
+        echo "  - Tunnel 6 saat sonra kapanacak"
+        echo "  - Xray versiyon: $(xray version | head -1)"
+        echo "  - Cloudflared versiyon: $(cloudflared --version)"
+
+    - name: Artifacts Yükle
+      uses: actions/upload-artifact@v4
+      with:
+        name: xray-config
+        path: |
+          vless-url.txt
+          tunnel-url.txt
+          client-config.json
+          sing-box-config.json
+        retention-days: 7
+
+    - name: Tunnel'ı Canlı Tut
+      run: |
+        echo "⏳ Xray + Cloudflared çalışıyor..."
+        echo ""
+        echo "📊 Logları izle:"
+        echo "  tail -f tunnel.log"
+        echo ""
+        echo "🔗 Tunnel URL: ${{ env.TUNNEL_URL }}"
+        echo ""
+        echo "📱 VLESS URL: ${{ env.VLESS_URL }}"
+        echo ""
+        echo "⏰ Kalan süre: 6 saat (GitHub Actions limiti)"
+        echo ""
+        echo "🛑 Durdurmak için workflow'u cancel et"
+        
+        # Sonsuz döngü - runner kapanana kadar çalışır
+        while true; do
+          sleep 60
+          # Her dakika tunnel log'u kontrol et
+          if ! pgrep -f "cloudflared tunnel" > /dev/null; then
+            echo "❌ Cloudflared durdu! Loglar:"
+            cat tunnel.log
+            exit 1
+          fi
+        done
