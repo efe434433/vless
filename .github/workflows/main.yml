@@ -11,51 +11,174 @@ jobs:
     - name: Kurulum
       run: |
         sudo apt update
-        sudo apt install -y docker.io curl wget
+        sudo apt install -y curl wget
+
+    - name: Docker Kur (Resmi Script)
+      run: |
+        # Docker'ı resmi script ile kur
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sudo sh get-docker.sh
+        
+        # Kullanıcıyı docker grubuna ekle
+        sudo usermod -aG docker $USER
+        
+        # Docker'ı başlat
         sudo systemctl start docker
+        sudo systemctl enable docker
+        
+        # Docker versiyon kontrol
+        sudo docker --version
 
     - name: Xray Docker Başlat
       run: |
-        # Xray container'ı başlat
-        docker run -d --name xray --restart=unless-stopped \
-          -p 10000:10000 \
-          -e UUID=$(cat /proc/sys/kernel/random/uuid) \
-          teddysun/xray:latest \
-          xray run -c /etc/xray/config.json
+        # UUID oluştur
+        UUID=$(cat /proc/sys/kernel/random/uuid)
+        echo "UUID=$UUID" >> $GITHUB_ENV
+        echo "✅ UUID: $UUID"
         
-        sleep 3
-        docker ps
+        # Xray config dosyası oluştur
+        cat << EOF > xray-config.json
+        {
+          "log": {
+            "loglevel": "warning"
+          },
+          "inbounds": [
+            {
+              "port": 10000,
+              "protocol": "vless",
+              "settings": {
+                "clients": [
+                  {
+                    "id": "${UUID}",
+                    "flow": "xtls-rprx-vision"
+                  }
+                ],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                  "path": "/"
+                }
+              }
+            }
+          ],
+          "outbounds": [
+            {
+              "protocol": "freedom",
+              "tag": "direct"
+            }
+          ]
+        }
+        EOF
+        
+        # Xray container'ı başlat
+        sudo docker run -d \
+          --name xray \
+          --restart=unless-stopped \
+          -p 10000:10000 \
+          -v $(pwd)/xray-config.json:/etc/xray/config.json:ro \
+          teddysun/xray:latest
+        
+        sleep 5
+        
+        # Container çalışıyor mu kontrol et
+        sudo docker ps
+        sudo docker logs xray
 
     - name: Cloudflared Kur
       run: |
+        # Cloudflared indir
         wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
         chmod +x cloudflared-linux-amd64
         sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+        cloudflared --version
 
-    - name: Tunnel Başlat
+    - name: Cloudflared Tunnel Başlat
+      id: tunnel
       run: |
+        # Tunnel'ı başlat
         nohup cloudflared tunnel --url http://localhost:10000 > tunnel.log 2>&1 &
-        sleep 10
         
-        URL=$(grep -o 'https://[a-z0-9]*\.trycloudflare\.com' tunnel.log | head -1)
-        echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-        echo "✅ Tunnel URL: $URL"
+        echo "⏳ Cloudflared başlatılıyor..."
+        sleep 15
+        
+        # URL'yi log'dan al
+        TUNNEL_URL=$(grep -o 'https://[a-z0-9]*\.trycloudflare\.com' tunnel.log | head -1)
+        
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "❌ Cloudflared başlatılamadı! Loglar:"
+          cat tunnel.log
+          exit 1
+        fi
+        
+        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+        echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+        echo "✅ Tunnel URL: $TUNNEL_URL"
 
-    - name: VLESS URL
+    - name: VLESS URL Oluştur
+      id: vless
       run: |
-        UUID=$(docker exec xray cat /etc/xray/config.json | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-        HOST=$(echo "${{ env.TUNNEL_URL }}" | sed 's|https://||')
-        VLESS="vless://$UUID@$HOST:443?path=/&security=tls&encryption=none&host=$HOST&type=ws#Xray-Docker"
+        UUID="${{ env.UUID }}"
+        TUNNEL_URL="${{ env.TUNNEL_URL }}"
         
+        HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
+        VLESS_URL="vless://${UUID}@${HOST}:443?path=/&security=tls&encryption=none&host=${HOST}&type=ws#Xray-Docker"
+        
+        echo "VLESS_URL=$VLESS_URL" >> $GITHUB_ENV
+        echo "vless_url=$VLESS_URL" >> $GITHUB_OUTPUT
+        
+        ENCODED=$(echo -n "$VLESS_URL" | base64 -w 0)
+        echo "ENCODED=$ENCODED" >> $GITHUB_ENV
+        
+        echo "$VLESS_URL" > vless-url.txt
+        echo "$TUNNEL_URL" > tunnel-url.txt
+
+    - name: Özet Göster
+      run: |
         echo "=========================================="
-        echo "✅ VLESS URL:"
-        echo "$VLESS"
+        echo "✅ XRAY + CLOUDFLARED TUNNEL HAZIR!"
         echo "=========================================="
         echo ""
-        echo "QR: https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=$(echo -n "$VLESS" | base64 -w 0)"
+        echo "🔗 Tunnel URL:"
+        echo "${{ env.TUNNEL_URL }}"
+        echo ""
+        echo "📱 VLESS URL:"
+        echo "${{ env.VLESS_URL }}"
+        echo ""
+        echo "📱 QR Code:"
+        echo "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${{ env.ENCODED }}"
+        echo ""
+        echo "=========================================="
+        echo "⚠️  Tunnel 6 saat sonra kapanacak"
 
-    - name: Canlı Tut
+    - name: Artifacts Yükle
+      uses: actions/upload-artifact@v4
+      with:
+        name: xray-config
+        path: |
+          vless-url.txt
+          tunnel-url.txt
+        retention-days: 7
+
+    - name: Tunnel'ı Canlı Tut
       run: |
-        echo "⏳ Tunnel çalışıyor... (6 saat max)"
-        echo "URL: ${{ env.TUNNEL_URL }}"
-        sleep infinity
+        echo "⏳ Xray + Cloudflared çalışıyor..."
+        echo "🔗 URL: ${{ env.TUNNEL_URL }}"
+        echo "📱 VLESS: ${{ env.VLESS_URL }}"
+        echo ""
+        echo "🛑 Durdurmak için workflow'u cancel et"
+        
+        while true; do
+          sleep 60
+          if ! pgrep -f "cloudflared tunnel" > /dev/null; then
+            echo "❌ Cloudflared durdu!"
+            cat tunnel.log
+            exit 1
+          fi
+          if ! sudo docker ps | grep -q xray; then
+            echo "❌ Xray durdu!"
+            sudo docker logs xray
+            exit 1
+          fi
+        done
