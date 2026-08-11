@@ -8,29 +8,11 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    # ============ 1. SİSTEM OPTİMİZASYONU ============
-    - name: Sistem Optimizasyonu (HIZLANDIRMA)
+    - name: Kurulum
       run: |
         sudo apt update
         sudo apt install -y curl wget unzip
-        
-        # DNS hızlandır (Cloudflare DNS)
-        echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf
-        echo "nameserver 1.0.0.1" | sudo tee -a /etc/resolv.conf
-        
-        # Kernel optimizasyonu - BBR + Büyük Buffer
-        sudo sysctl -w net.core.rmem_max=134217728
-        sudo sysctl -w net.core.wmem_max=134217728
-        sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728"
-        sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728"
-        sudo sysctl -w net.core.default_qdisc=fq
-        sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
-        sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
-        sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384
-        
-        echo "✅ Sistem optimize edildi (BBR + büyük buffer)"
 
-    # ============ 2. XRAY KUR ============
     - name: Xray Binary İndir
       run: |
         wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
@@ -39,14 +21,13 @@ jobs:
         sudo mv xray /usr/local/bin/
         xray version
 
-    # ============ 3. XRAY CONFIG (gRPC + Vision) ============
-    - name: Xray Config ve Başlat (gRPC)
+    - name: Xray Config ve Başlat (gRPC + Vision)
       run: |
         UUID=$(cat /proc/sys/kernel/random/uuid)
         echo "UUID=$UUID" >> $GITHUB_ENV
         echo "✅ UUID: $UUID"
         
-        # gRPC config - WS'den DAHA HIZLI!
+        # gRPC config - WebSocket'ten DAHA HIZLI!
         cat << EOF > config.json
         {
           "inbounds": [{
@@ -73,13 +54,11 @@ jobs:
         }
         EOF
         
-        # Xray'i tüm CPU gücüyle çalıştır
-        nohup xray run -config config.json -cpus 4 > xray.log 2>&1 &
+        nohup xray run -config config.json > xray.log 2>&1 &
         sleep 3
         echo "✅ Xray başlatıldı (gRPC + Vision)"
         cat xray.log
 
-    # ============ 4. CLOUDFLARED KUR ============
     - name: Cloudflared Kur
       run: |
         wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -87,21 +66,17 @@ jobs:
         sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
         cloudflared --version
 
-    # ============ 5. CLOUDFLARED TUNNEL (HIZLI MOD) ============
-    - name: Cloudflared Tunnel Başlat (Hızlı)
+    - name: Cloudflared Tunnel Başlat (Hızlı Mod)
       run: |
-        # HTTP/2 + 4 paralel bağlantı + büyük buffer
+        # HTTP/2 + 4 paralel bağlantı
         nohup cloudflared tunnel --url http://localhost:10000 \
           --protocol http2 \
           --ha-connections 4 \
-          --heartbeat-interval 10s \
-          --metrics 127.0.0.1:20241 \
           > tunnel.log 2>&1 &
         
         echo "⏳ Cloudflared başlatılıyor (HTTP/2 + 4 bağlantı)..."
         sleep 12
         
-        # URL'yi log'dan al
         TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' tunnel.log | head -1)
         
         if [ -z "$TUNNEL_URL" ]; then
@@ -113,7 +88,6 @@ jobs:
         echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
         echo "✅ Tunnel URL: $TUNNEL_URL"
 
-    # ============ 6. VLESS URL (gRPC) ============
     - name: VLESS URL Oluştur (gRPC)
       run: |
         UUID="${{ env.UUID }}"
@@ -122,7 +96,7 @@ jobs:
         HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
         
         # gRPC URL - type=grpc
-        VLESS_URL="vless://${UUID}@${HOST}:443?security=tls&encryption=none&host=${HOST}&type=grpc&serviceName=vless#HIZLI-gRPC"
+        VLESS_URL="vless://${UUID}@${HOST}:443?security=tls&encryption=none&host=${HOST}&type=grpc&serviceName=vless#gRPC-HIZLI"
         
         echo "VLESS_URL=$VLESS_URL" >> $GITHUB_ENV
         
@@ -131,7 +105,6 @@ jobs:
         
         echo "$VLESS_URL" > vless-url.txt
         echo "$TUNNEL_URL" > tunnel-url.txt
-        echo "URL: $VLESS_URL" > url-info.txt
         
         echo "=========================================="
         echo "⚡ HIZLI VLESS URL (gRPC) OLUŞTURULDU!"
@@ -147,12 +120,11 @@ jobs:
         echo "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=$ENCODED"
         echo ""
         echo "=========================================="
-        echo "🚀 HIZ KARŞILAŞTIRMASI:"
+        echo "🚀 WS vs gRPC:"
         echo "  WS:    ~80-120 Mbps"
         echo "  gRPC:  ~150-250 Mbps ⚡"
         echo "=========================================="
 
-    # ============ 7. YEDEK WS URL (Her ihtimale karşı) ============
     - name: Yedek WS URL Oluştur
       run: |
         UUID="${{ env.UUID }}"
@@ -160,9 +132,7 @@ jobs:
         
         WS_URL="vless://${UUID}@${HOST}:443?path=/&security=tls&encryption=none&host=${HOST}&type=ws#Yedek-WS"
         echo "$WS_URL" > ws-url.txt
-        echo "✅ Yedek WS URL oluşturuldu (ws-url.txt)"
 
-    # ============ 8. ARTIFACTS ============
     - name: Artifacts Yükle
       uses: actions/upload-artifact@v4
       with:
@@ -171,10 +141,8 @@ jobs:
           vless-url.txt
           ws-url.txt
           tunnel-url.txt
-          url-info.txt
         retention-days: 7
 
-    # ============ 9. CANLI TUT ============
     - name: Tunnel'ı Canlı Tut
       run: |
         echo "=========================================="
@@ -182,35 +150,20 @@ jobs:
         echo "=========================================="
         echo ""
         echo "🔗 Tunnel URL: ${{ env.TUNNEL_URL }}"
-        echo "📱 VLESS URL (gRPC): ${{ env.VLESS_URL }}"
+        echo "📱 gRPC URL: ${{ env.VLESS_URL }}"
         echo ""
-        echo "🚀 HIZ: gRPC + Vision + HTTP/2 + BBR"
+        echo "🚀 HIZ: gRPC + Vision + HTTP/2 + 4 bağlantı"
         echo "⏰ Kalan süre: ~6 saat"
         echo "🛑 Durdurmak için: workflow'u cancel et"
         echo "=========================================="
         
-        # Her 5 dakikada bir durum göster
-        COUNTER=0
         while true; do
           sleep 60
-          COUNTER=$((COUNTER + 1))
-          
-          # Her 5 dakikada bir log göster
-          if [ $((COUNTER % 5)) -eq 0 ]; then
-            echo "⏳ $((COUNTER * 60)) saniye çalışıyor..."
-            echo "📊 Son 10 satır tunnel log:"
-            tail -3 tunnel.log
-            echo "---"
-          fi
-          
-          # Cloudflared kontrol
           if ! pgrep -f "cloudflared tunnel" > /dev/null; then
             echo "❌ Cloudflared durdu! Loglar:"
             cat tunnel.log
             exit 1
           fi
-          
-          # Xray kontrol
           if ! pgrep -f "xray run" > /dev/null; then
             echo "❌ Xray durdu!"
             cat xray.log
