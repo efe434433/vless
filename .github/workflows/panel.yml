@@ -218,7 +218,7 @@ jobs:
             for (const s of servers) {
               const traffic = await fetchTraffic(s.uuid);
               s.usage = traffic.uplink + traffic.downlink;
-              if (s.limit !== 'unlimited' && s.usage > s.limit * 1024 * 1024 * 1024) {
+              if (s.limit !== 'unlimited' && s.usage > s.limit * s.limitUnitMultiplier) {
                 s.active = false;
               } else {
                 s.active = true;
@@ -234,8 +234,9 @@ jobs:
                 name: s.name,
                 port: s.port,
                 limit: s.limit,
+                limitUnit: s.limitUnit || 'GB',
                 usage: s.usage || 0,
-                remaining: s.limit === 'unlimited' ? '∞' : Math.max(0, s.limit * 1024 * 1024 * 1024 - (s.usage || 0)),
+                remaining: s.limit === 'unlimited' ? '∞' : Math.max(0, s.limit * s.limitUnitMultiplier - (s.usage || 0)),
                 active: s.active !== false,
                 tunnelUrl: s.tunnelUrl || 'pending',
                 vlessUrl: s.vlessUrl || ''
@@ -244,18 +245,21 @@ jobs:
           });
 
           app.post('/api/create', async (req, res) => {
-            const { name, limit } = req.body;
+            const { name, limit, unit } = req.body;
             if (!name) return res.status(400).json({ error: 'İsim gerekli' });
             if (getServers().some(s => s.name === name)) {
               return res.status(400).json({ error: 'Bu isim zaten kullanılıyor' });
             }
             const port = getRandomPort();
             const uuid = uuidv4();
+            const multiplier = unit === 'MB' ? 1024 * 1024 : 1024 * 1024 * 1024;
             const newServer = {
               name,
               port,
               uuid,
               limit: limit === 'unlimited' ? 'unlimited' : parseFloat(limit),
+              limitUnit: unit || 'GB',
+              limitUnitMultiplier: multiplier,
               active: true,
               tunnelUrl: null,
               vlessUrl: null,
@@ -307,7 +311,7 @@ jobs:
           <body>
             <div id="login-overlay">
               <div id="login-box">
-                <h1><i class="fas fa-lock"></i> Mentalite Panel</h1>
+                <h1><i class="fas fa-lock"></i> Mentalite</h1>
                 <input type="password" id="password-input" placeholder="Şifre">
                 <button id="login-btn">Giriş</button>
                 <div id="login-error" style="color:#f44336; margin-top:10px; display:none;">Şifre yanlış!</div>
@@ -338,9 +342,15 @@ jobs:
                     <input type="text" id="serverName" placeholder="Server Name" required>
                     <div>
                       <label><input type="radio" name="limitType" value="unlimited" checked> Unlimited</label>
-                      <label><input type="radio" name="limitType" value="gb"> GB Limit</label>
+                      <label><input type="radio" name="limitType" value="limited"> Limited</label>
                     </div>
-                    <input type="number" id="limitGb" placeholder="GB" disabled>
+                    <div id="limitGroup" style="display:none;">
+                      <input type="number" id="limitValue" placeholder="Miktar" min="1" step="1" required>
+                      <select id="limitUnit">
+                        <option value="MB">MB</option>
+                        <option value="GB" selected>GB</option>
+                      </select>
+                    </div>
                     <button type="submit"><i class="fas fa-rocket"></i> Create</button>
                   </form>
                   <div id="createResult"></div>
@@ -354,75 +364,76 @@ jobs:
 
           cat > public/style.css << 'EOF'
           * { margin:0; padding:0; box-sizing:border-box; }
-          body { font-family:'Segoe UI',sans-serif; background:#1a1a1a; color:#eee; display:flex; height:100vh; }
-          #login-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); display:flex; justify-content:center; align-items:center; z-index:999; }
-          #login-box { background:#222; padding:40px; border-radius:12px; border:1px solid #444; text-align:center; width:320px; }
-          #login-box h1 { font-weight:300; margin-bottom:30px; }
-          #login-box input { width:100%; padding:12px; border:none; border-radius:6px; background:#333; color:#eee; font-size:16px; }
-          #login-box button { width:100%; padding:12px; margin-top:15px; border:none; border-radius:6px; background:#444; color:#eee; font-size:16px; cursor:pointer; transition:0.2s; }
-          #login-box button:hover { background:#555; }
-          .sidebar { width:220px; background:#111; padding:20px 0; border-right:1px solid #333; display:flex; flex-direction:column; }
-          .logo { font-size:22px; font-weight:bold; padding:0 20px 30px; letter-spacing:2px; color:#fff; }
-          .menu { list-style:none; flex:1; }
-          .menu li { padding:14px 20px; cursor:pointer; border-left:3px solid transparent; transition:0.2s; display:flex; align-items:center; gap:12px; }
-          .menu li i { width:20px; }
-          .menu li:hover { background:#222; }
-          .menu li.active { background:#222; border-left-color:#fff; color:#fff; }
-          .main { flex:1; padding:30px; overflow-y:auto; }
-          .section { display:none; animation:fade 0.3s; }
+          body { font-family:'Segoe UI',sans-serif; background:#0d0d0d; color:#e0e0e0; display:flex; height:100vh; overflow:hidden; }
+          #login-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.92); display:flex; justify-content:center; align-items:center; z-index:999; backdrop-filter:blur(8px); }
+          #login-box { background:linear-gradient(145deg,#1a1a1a,#222); padding:50px; border-radius:20px; border:1px solid #333; box-shadow:0 20px 60px rgba(0,0,0,0.8); text-align:center; width:340px; animation:float 3s infinite alternate; }
+          @keyframes float { 0% { transform:translateY(0); } 100% { transform:translateY(-10px); } }
+          #login-box h1 { font-weight:300; margin-bottom:30px; letter-spacing:2px; color:#fff; }
+          #login-box input { width:100%; padding:14px; border:none; border-radius:10px; background:#2a2a2a; color:#eee; font-size:16px; outline:2px solid transparent; transition:0.3s; }
+          #login-box input:focus { outline-color:#555; }
+          #login-box button { width:100%; padding:14px; margin-top:20px; border:none; border-radius:10px; background:#333; color:#fff; font-size:16px; cursor:pointer; transition:0.3s; letter-spacing:1px; }
+          #login-box button:hover { background:#444; transform:scale(1.02); }
+          .sidebar { width:240px; background:#111; padding:25px 0; border-right:1px solid #2a2a2a; display:flex; flex-direction:column; height:100vh; position:sticky; top:0; }
+          .logo { font-size:24px; font-weight:300; padding:0 25px 40px; letter-spacing:4px; color:#fff; text-transform:uppercase; border-bottom:1px solid #2a2a2a; }
+          .menu { list-style:none; flex:1; padding-top:20px; }
+          .menu li { padding:16px 25px; cursor:pointer; border-left:3px solid transparent; transition:0.3s; display:flex; align-items:center; gap:15px; color:#999; }
+          .menu li i { width:24px; font-size:18px; }
+          .menu li:hover { background:#1a1a1a; color:#fff; }
+          .menu li.active { background:#1a1a1a; border-left-color:#fff; color:#fff; }
+          .main { flex:1; padding:35px 40px; overflow-y:auto; background:#0d0d0d; }
+          .section { display:none; animation:fade 0.4s; }
           .section.active { display:block; }
-          @keyframes fade { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
-          h2 { font-weight:300; font-size:24px; margin-bottom:25px; border-bottom:1px solid #333; padding-bottom:10px; }
-          .stats { display:flex; gap:20px; margin-bottom:30px; flex-wrap:wrap; }
-          .stat-card { background:#222; padding:20px 30px; border-radius:8px; flex:1; min-width:120px; border:1px solid #333; transition:0.3s; }
-          .stat-card:hover { background:#2a2a2a; border-color:#555; }
-          .stat-card i { margin-right:10px; color:#aaa; }
-          .stat-card span { font-weight:bold; font-size:22px; display:block; margin-top:5px; }
-          #serverList { display:flex; flex-direction:column; gap:12px; }
-          .server-item { background:#222; padding:15px 20px; border-radius:6px; border-left:4px solid #555; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; transition:0.2s; }
-          .server-item:hover { background:#2a2a2a; }
-          .server-item .info { display:flex; gap:20px; align-items:center; flex-wrap:wrap; }
-          .server-item .info span { background:#333; padding:2px 10px; border-radius:12px; font-size:13px; }
-          .server-item .actions button { background:none; border:none; color:#eee; cursor:pointer; margin-left:10px; font-size:16px; transition:0.2s; }
-          .server-item .actions button:hover { color:#ff6b6b; }
-          .server-item .status { display:flex; align-items:center; gap:12px; }
-          .status-indicator { width:10px; height:10px; border-radius:50%; display:inline-block; }
-          .status-indicator.active { background:#4caf50; }
-          .status-indicator.inactive { background:#f44336; }
-          form { background:#222; padding:25px; border-radius:8px; max-width:500px; border:1px solid #333; }
-          form input, form button { display:block; width:100%; padding:12px; margin:12px 0; border:none; border-radius:4px; background:#333; color:#eee; font-size:16px; }
-          form button { background:#444; cursor:pointer; transition:0.2s; font-weight:bold; }
-          form button:hover { background:#555; }
-          form div { display:flex; gap:20px; align-items:center; margin:10px 0; }
-          form label { display:flex; align-items:center; gap:6px; color:#ccc; }
-          input:disabled { opacity:0.5; }
-          #createResult { margin-top:20px; padding:15px; background:#222; border-radius:4px; border:1px solid #444; }
+          @keyframes fade { from { opacity:0; transform:translateY(15px); } to { opacity:1; transform:translateY(0); } }
+          h2 { font-weight:300; font-size:26px; margin-bottom:30px; border-bottom:1px solid #2a2a2a; padding-bottom:15px; letter-spacing:1px; color:#fff; }
+          .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px,1fr)); gap:20px; margin-bottom:35px; }
+          .stat-card { background:linear-gradient(145deg,#161616,#1e1e1e); padding:22px 25px; border-radius:12px; border:1px solid #2a2a2a; transition:0.3s; }
+          .stat-card:hover { transform:translateY(-5px); box-shadow:0 8px 30px rgba(0,0,0,0.5); }
+          .stat-card i { font-size:24px; color:#888; margin-right:10px; }
+          .stat-card span { font-weight:300; font-size:28px; display:block; margin-top:8px; color:#fff; }
+          #serverList { display:flex; flex-direction:column; gap:14px; }
+          .server-item { background:linear-gradient(145deg,#161616,#1e1e1e); padding:18px 22px; border-radius:10px; border-left:4px solid #555; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; transition:0.3s; }
+          .server-item:hover { background:#1e1e1e; transform:scale(1.01); }
+          .server-item .info { display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
+          .server-item .info span { background:#2a2a2a; padding:4px 12px; border-radius:20px; font-size:13px; color:#ccc; }
+          .server-item .actions button { background:none; border:none; color:#aaa; cursor:pointer; margin-left:12px; font-size:18px; transition:0.2s; }
+          .server-item .actions button:hover { color:#fff; }
+          .status-indicator { width:12px; height:12px; border-radius:50%; display:inline-block; }
+          .status-indicator.active { background:#4caf50; box-shadow:0 0 12px #4caf50; }
+          .status-indicator.inactive { background:#f44336; box-shadow:0 0 12px #f44336; }
+          form { background:linear-gradient(145deg,#161616,#1e1e1e); padding:30px; border-radius:12px; max-width:550px; border:1px solid #2a2a2a; }
+          form input, form select, form button { display:block; width:100%; padding:14px; margin:14px 0; border:none; border-radius:10px; background:#2a2a2a; color:#eee; font-size:16px; }
+          form select { appearance:none; }
+          form button { background:#333; cursor:pointer; transition:0.3s; font-weight:bold; letter-spacing:1px; }
+          form button:hover { background:#444; transform:scale(1.02); }
+          form div { display:flex; gap:20px; align-items:center; margin:12px 0; flex-wrap:wrap; }
+          form label { display:flex; align-items:center; gap:8px; color:#bbb; cursor:pointer; }
+          #limitGroup { display:flex; gap:12px; align-items:center; }
+          #limitGroup input { flex:2; }
+          #limitGroup select { flex:1; }
+          #createResult { margin-top:20px; padding:18px; background:#161616; border-radius:8px; border:1px solid #2a2a2a; word-break:break-all; }
           EOF
 
           cat > public/script.js << 'EOF'
           document.addEventListener('DOMContentLoaded', () => {
+            const PASSWORD = 'mentalite11331352s';
             const passwordInput = document.getElementById('password-input');
             const loginBtn = document.getElementById('login-btn');
             const loginOverlay = document.getElementById('login-overlay');
             const app = document.getElementById('app');
             const errorDiv = document.getElementById('login-error');
 
-            const PASSWORD = 'mentalite11331352s';
-
             function login() {
-              const pass = passwordInput.value;
-              if (pass === PASSWORD) {
+              if (passwordInput.value === PASSWORD) {
                 loginOverlay.style.display = 'none';
                 app.style.display = 'flex';
                 loadStatus();
-                setInterval(loadStatus, 10000);
+                setInterval(loadStatus, 2000);
               } else {
                 errorDiv.style.display = 'block';
                 passwordInput.value = '';
                 passwordInput.focus();
               }
             }
-
             loginBtn.addEventListener('click', login);
             passwordInput.addEventListener('keyup', (e) => { if (e.key === 'Enter') login(); });
 
@@ -430,18 +441,16 @@ jobs:
               item.addEventListener('click', () => {
                 document.querySelectorAll('.menu li').forEach(l => l.classList.remove('active'));
                 item.classList.add('active');
-                const section = item.dataset.section;
                 document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-                document.getElementById(section).classList.add('active');
+                document.getElementById(item.dataset.section).classList.add('active');
               });
             });
 
             const limitRadios = document.querySelectorAll('input[name="limitType"]');
-            const limitGbInput = document.getElementById('limitGb');
+            const limitGroup = document.getElementById('limitGroup');
             limitRadios.forEach(r => {
               r.addEventListener('change', () => {
-                limitGbInput.disabled = r.value !== 'gb';
-                if (r.value === 'gb') limitGbInput.focus();
+                limitGroup.style.display = r.value === 'limited' ? 'flex' : 'none';
               });
             });
 
@@ -449,35 +458,38 @@ jobs:
               e.preventDefault();
               const name = document.getElementById('serverName').value.trim();
               const limitType = document.querySelector('input[name="limitType"]:checked').value;
-              let limit = 'unlimited';
-              if (limitType === 'gb') {
-                limit = parseFloat(document.getElementById('limitGb').value);
-                if (!limit || limit <= 0) { alert('Geçerli bir GB değeri girin'); return; }
+              let limit = 'unlimited', unit = 'GB';
+              if (limitType === 'limited') {
+                limit = parseFloat(document.getElementById('limitValue').value);
+                unit = document.getElementById('limitUnit').value;
+                if (!limit || limit <= 0) { alert('Geçerli bir miktar girin'); return; }
               }
               const res = await fetch('/api/create', {
                 method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'x-password': PASSWORD
-                },
-                body: JSON.stringify({ name, limit })
+                headers: { 'Content-Type':'application/json','x-password':PASSWORD },
+                body: JSON.stringify({ name, limit, unit })
               });
               const data = await res.json();
+              const resultDiv = document.getElementById('createResult');
               if (data.success) {
-                document.getElementById('createResult').innerHTML = `<i class="fas fa-check-circle" style="color:#4caf50;"></i> Server "${name}" oluşturuldu. Port: ${data.server.port}`;
+                const s = data.server;
+                resultDiv.innerHTML = `
+                  <i class="fas fa-check-circle" style="color:#4caf50;"></i> Server "${name}" oluşturuldu.<br>
+                  <strong>Port:</strong> ${s.port}<br>
+                  <strong>Limit:</strong> ${s.limit} ${s.limitUnit}<br>
+                  <strong>Tunnel URL:</strong> ${s.tunnelUrl || 'Hazırlanıyor...'}<br>
+                  <strong>VLESS:</strong> ${s.vlessUrl || 'Hazırlanıyor...'}
+                `;
                 document.getElementById('serverName').value = '';
-                document.getElementById('limitGb').value = '';
-                loadStatus();
+                document.getElementById('limitValue').value = '';
               } else {
-                document.getElementById('createResult').innerHTML = `<i class="fas fa-exclamation-triangle" style="color:#f44336;"></i> Hata: ${data.error}`;
+                resultDiv.innerHTML = `<i class="fas fa-exclamation-triangle" style="color:#f44336;"></i> Hata: ${data.error}`;
               }
             });
 
             async function loadStatus() {
               try {
-                const res = await fetch('/api/status', {
-                  headers: { 'x-password': PASSWORD }
-                });
+                const res = await fetch('/api/status', { headers: { 'x-password': PASSWORD } });
                 if (!res.ok) throw new Error('Yetkisiz');
                 const data = await res.json();
                 document.getElementById('cpu').textContent = data.cpu.toFixed(1);
@@ -495,9 +507,9 @@ jobs:
                     <div class="info">
                       <strong>${s.name}</strong>
                       <span>Port: ${s.port}</span>
-                      <span>Limit: ${s.limit === 'unlimited' ? '∞' : s.limit + ' GB'}</span>
-                      <span>Kullanım: ${(s.usage / 1024 / 1024 / 1024).toFixed(2)} GB</span>
-                      <span>Kalan: ${s.remaining === '∞' ? '∞' : (s.remaining / 1024 / 1024 / 1024).toFixed(2) + ' GB'}</span>
+                      <span>Limit: ${s.limit === 'unlimited' ? '∞' : s.limit + ' ' + s.limitUnit}</span>
+                      <span>Kullanım: ${(s.usage / 1024 / 1024).toFixed(2)} MB</span>
+                      <span>Kalan: ${s.remaining === '∞' ? '∞' : (s.remaining / 1024 / 1024).toFixed(2) + ' MB'}</span>
                       <span class="status-indicator ${s.active ? 'active' : 'inactive'}"></span>
                     </div>
                     <div class="actions">
