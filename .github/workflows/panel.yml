@@ -218,7 +218,7 @@ jobs:
             for (const s of servers) {
               const traffic = await fetchTraffic(s.uuid);
               s.usage = traffic.uplink + traffic.downlink;
-              if (s.limit !== 'unlimited' && s.usage > s.limit * s.limitUnitMultiplier) {
+              if (s.limit !== 'unlimited' && s.usage > s.limit) {
                 s.active = false;
               } else {
                 s.active = true;
@@ -236,7 +236,7 @@ jobs:
                 limit: s.limit,
                 limitUnit: s.limitUnit || 'GB',
                 usage: s.usage || 0,
-                remaining: s.limit === 'unlimited' ? '∞' : Math.max(0, s.limit * s.limitUnitMultiplier - (s.usage || 0)),
+                remaining: s.limit === 'unlimited' ? '∞' : Math.max(0, s.limit - (s.usage || 0)),
                 active: s.active !== false,
                 tunnelUrl: s.tunnelUrl || 'pending',
                 vlessUrl: s.vlessUrl || ''
@@ -250,16 +250,34 @@ jobs:
             if (getServers().some(s => s.name === name)) {
               return res.status(400).json({ error: 'Bu isim zaten kullanılıyor' });
             }
+            let limitBytes = 'unlimited';
+            let limitUnit = 'unlimited';
+            if (limit !== 'unlimited') {
+              const num = parseFloat(limit);
+              if (isNaN(num) || num <= 0) return res.status(400).json({ error: 'Geçerli bir sayı girin' });
+              const unitLower = (unit || 'GB').toUpperCase();
+              if (unitLower === 'MB') {
+                limitBytes = num * 1024 * 1024;
+                limitUnit = 'MB';
+              } else if (unitLower === 'GB') {
+                limitBytes = num * 1024 * 1024 * 1024;
+                limitUnit = 'GB';
+              } else {
+                return res.status(400).json({ error: 'Birim MB veya GB olmalı' });
+              }
+            } else {
+              limitBytes = 'unlimited';
+              limitUnit = 'unlimited';
+            }
+
             const port = getRandomPort();
             const uuid = uuidv4();
-            const multiplier = unit === 'MB' ? 1024 * 1024 : 1024 * 1024 * 1024;
             const newServer = {
               name,
               port,
               uuid,
-              limit: limit === 'unlimited' ? 'unlimited' : parseFloat(limit),
-              limitUnit: unit || 'GB',
-              limitUnitMultiplier: multiplier,
+              limit: limitBytes,
+              limitUnit: limitUnit,
               active: true,
               tunnelUrl: null,
               vlessUrl: null,
@@ -311,7 +329,7 @@ jobs:
           <body>
             <div id="login-overlay">
               <div id="login-box">
-                <h1><i class="fas fa-lock"></i> Mentalite</h1>
+                <h1><i class="fas fa-lock"></i> Mentalite Panel</h1>
                 <input type="password" id="password-input" placeholder="Şifre">
                 <button id="login-btn">Giriş</button>
                 <div id="login-error" style="color:#f44336; margin-top:10px; display:none;">Şifre yanlış!</div>
@@ -340,12 +358,12 @@ jobs:
                   <h2><i class="fas fa-plus-circle"></i> Create Server</h2>
                   <form id="createForm">
                     <input type="text" id="serverName" placeholder="Server Name" required>
-                    <div>
+                    <div class="limit-group">
                       <label><input type="radio" name="limitType" value="unlimited" checked> Unlimited</label>
                       <label><input type="radio" name="limitType" value="limited"> Limited</label>
                     </div>
-                    <div id="limitGroup" style="display:none;">
-                      <input type="number" id="limitValue" placeholder="Miktar" min="1" step="1" required>
+                    <div class="limit-input-group" style="display:none;">
+                      <input type="number" id="limitValue" placeholder="Miktar" min="1" step="1">
                       <select id="limitUnit">
                         <option value="MB">MB</option>
                         <option value="GB" selected>GB</option>
@@ -364,62 +382,73 @@ jobs:
 
           cat > public/style.css << 'EOF'
           * { margin:0; padding:0; box-sizing:border-box; }
-          body { font-family:'Segoe UI',sans-serif; background:#0d0d0d; color:#e0e0e0; display:flex; height:100vh; overflow:hidden; }
-          #login-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.92); display:flex; justify-content:center; align-items:center; z-index:999; backdrop-filter:blur(8px); }
-          #login-box { background:linear-gradient(145deg,#1a1a1a,#222); padding:50px; border-radius:20px; border:1px solid #333; box-shadow:0 20px 60px rgba(0,0,0,0.8); text-align:center; width:340px; animation:float 3s infinite alternate; }
-          @keyframes float { 0% { transform:translateY(0); } 100% { transform:translateY(-10px); } }
-          #login-box h1 { font-weight:300; margin-bottom:30px; letter-spacing:2px; color:#fff; }
-          #login-box input { width:100%; padding:14px; border:none; border-radius:10px; background:#2a2a2a; color:#eee; font-size:16px; outline:2px solid transparent; transition:0.3s; }
-          #login-box input:focus { outline-color:#555; }
-          #login-box button { width:100%; padding:14px; margin-top:20px; border:none; border-radius:10px; background:#333; color:#fff; font-size:16px; cursor:pointer; transition:0.3s; letter-spacing:1px; }
-          #login-box button:hover { background:#444; transform:scale(1.02); }
-          .sidebar { width:240px; background:#111; padding:25px 0; border-right:1px solid #2a2a2a; display:flex; flex-direction:column; height:100vh; position:sticky; top:0; }
-          .logo { font-size:24px; font-weight:300; padding:0 25px 40px; letter-spacing:4px; color:#fff; text-transform:uppercase; border-bottom:1px solid #2a2a2a; }
-          .menu { list-style:none; flex:1; padding-top:20px; }
-          .menu li { padding:16px 25px; cursor:pointer; border-left:3px solid transparent; transition:0.3s; display:flex; align-items:center; gap:15px; color:#999; }
-          .menu li i { width:24px; font-size:18px; }
-          .menu li:hover { background:#1a1a1a; color:#fff; }
-          .menu li.active { background:#1a1a1a; border-left-color:#fff; color:#fff; }
-          .main { flex:1; padding:35px 40px; overflow-y:auto; background:#0d0d0d; }
-          .section { display:none; animation:fade 0.4s; }
+          body { font-family:'Segoe UI',sans-serif; background:#0d0d0d; color:#eee; height:100vh; overflow:hidden; display:flex; }
+          #login-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.95); display:flex; justify-content:center; align-items:center; z-index:999; backdrop-filter:blur(8px); }
+          #login-box { background:linear-gradient(145deg,#1a1a1a,#2a2a2a); padding:40px; border-radius:16px; border:1px solid #444; box-shadow:0 20px 60px rgba(0,0,0,0.8); text-align:center; width:340px; animation:fadeIn 0.6s ease; }
+          #login-box h1 { font-weight:300; margin-bottom:30px; letter-spacing:2px; }
+          #login-box input { width:100%; padding:14px; border:none; border-radius:8px; background:#333; color:#eee; font-size:16px; transition:0.3s; }
+          #login-box input:focus { outline:2px solid #666; background:#3a3a3a; }
+          #login-box button { width:100%; padding:14px; margin-top:18px; border:none; border-radius:8px; background:linear-gradient(135deg,#555,#777); color:#fff; font-size:16px; font-weight:bold; cursor:pointer; transition:0.3s; }
+          #login-box button:hover { transform:scale(1.02); background:linear-gradient(135deg,#666,#888); }
+          .sidebar { width:220px; background:linear-gradient(180deg,#111,#1a1a1a); padding:20px 0; border-right:1px solid #2a2a2a; display:flex; flex-direction:column; }
+          .logo { font-size:24px; font-weight:300; padding:0 20px 30px; letter-spacing:3px; color:#fff; text-shadow:0 0 10px rgba(255,255,255,0.1); }
+          .menu { list-style:none; flex:1; }
+          .menu li { padding:14px 20px; cursor:pointer; border-left:3px solid transparent; transition:0.3s; display:flex; align-items:center; gap:14px; font-weight:300; }
+          .menu li i { width:22px; color:#aaa; transition:0.3s; }
+          .menu li:hover { background:#252525; border-left-color:#666; }
+          .menu li:hover i { color:#fff; }
+          .menu li.active { background:#252525; border-left-color:#fff; color:#fff; }
+          .menu li.active i { color:#fff; }
+          .main { flex:1; padding:30px; overflow-y:auto; background:radial-gradient(circle at 20% 30%, #151515, #0a0a0a); }
+          .section { display:none; animation:fadeIn 0.5s ease; }
           .section.active { display:block; }
-          @keyframes fade { from { opacity:0; transform:translateY(15px); } to { opacity:1; transform:translateY(0); } }
-          h2 { font-weight:300; font-size:26px; margin-bottom:30px; border-bottom:1px solid #2a2a2a; padding-bottom:15px; letter-spacing:1px; color:#fff; }
-          .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px,1fr)); gap:20px; margin-bottom:35px; }
-          .stat-card { background:linear-gradient(145deg,#161616,#1e1e1e); padding:22px 25px; border-radius:12px; border:1px solid #2a2a2a; transition:0.3s; }
-          .stat-card:hover { transform:translateY(-5px); box-shadow:0 8px 30px rgba(0,0,0,0.5); }
-          .stat-card i { font-size:24px; color:#888; margin-right:10px; }
-          .stat-card span { font-weight:300; font-size:28px; display:block; margin-top:8px; color:#fff; }
+          @keyframes fadeIn { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+          h2 { font-weight:300; font-size:26px; margin-bottom:25px; border-bottom:1px solid #333; padding-bottom:12px; letter-spacing:1px; }
+          .stats { display:flex; gap:20px; margin-bottom:35px; flex-wrap:wrap; }
+          .stat-card { background:linear-gradient(145deg,#1e1e1e,#2a2a2a); padding:22px 30px; border-radius:12px; flex:1; min-width:140px; border:1px solid #333; box-shadow:0 8px 24px rgba(0,0,0,0.4); transition:0.3s; }
+          .stat-card:hover { transform:translateY(-4px); border-color:#555; box-shadow:0 12px 32px rgba(0,0,0,0.6); }
+          .stat-card i { margin-right:12px; color:#aaa; }
+          .stat-card span { font-weight:bold; font-size:26px; display:block; margin-top:6px; letter-spacing:1px; }
           #serverList { display:flex; flex-direction:column; gap:14px; }
-          .server-item { background:linear-gradient(145deg,#161616,#1e1e1e); padding:18px 22px; border-radius:10px; border-left:4px solid #555; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; transition:0.3s; }
-          .server-item:hover { background:#1e1e1e; transform:scale(1.01); }
-          .server-item .info { display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
-          .server-item .info span { background:#2a2a2a; padding:4px 12px; border-radius:20px; font-size:13px; color:#ccc; }
-          .server-item .actions button { background:none; border:none; color:#aaa; cursor:pointer; margin-left:12px; font-size:18px; transition:0.2s; }
-          .server-item .actions button:hover { color:#fff; }
+          .server-item { background:linear-gradient(145deg,#1a1a1a,#262626); padding:16px 22px; border-radius:10px; border-left:5px solid #555; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; transition:0.3s; box-shadow:0 4px 12px rgba(0,0,0,0.3); }
+          .server-item:hover { background:#2a2a2a; transform:scale(1.005); border-left-color:#888; }
+          .server-item .info { display:flex; gap:18px; align-items:center; flex-wrap:wrap; font-size:14px; }
+          .server-item .info strong { font-size:16px; color:#fff; }
+          .server-item .info span { background:#333; padding:4px 12px; border-radius:20px; font-size:12px; }
+          .server-item .actions { display:flex; gap:12px; align-items:center; }
+          .server-item .actions a, .server-item .actions button { background:none; border:none; color:#ccc; cursor:pointer; font-size:18px; transition:0.3s; padding:6px; border-radius:6px; }
+          .server-item .actions a:hover, .server-item .actions button:hover { color:#fff; background:#3a3a3a; }
+          .server-item .actions button:hover { color:#ff6b6b; }
           .status-indicator { width:12px; height:12px; border-radius:50%; display:inline-block; }
           .status-indicator.active { background:#4caf50; box-shadow:0 0 12px #4caf50; }
           .status-indicator.inactive { background:#f44336; box-shadow:0 0 12px #f44336; }
-          form { background:linear-gradient(145deg,#161616,#1e1e1e); padding:30px; border-radius:12px; max-width:550px; border:1px solid #2a2a2a; }
-          form input, form select, form button { display:block; width:100%; padding:14px; margin:14px 0; border:none; border-radius:10px; background:#2a2a2a; color:#eee; font-size:16px; }
-          form select { appearance:none; }
-          form button { background:#333; cursor:pointer; transition:0.3s; font-weight:bold; letter-spacing:1px; }
-          form button:hover { background:#444; transform:scale(1.02); }
-          form div { display:flex; gap:20px; align-items:center; margin:12px 0; flex-wrap:wrap; }
-          form label { display:flex; align-items:center; gap:8px; color:#bbb; cursor:pointer; }
-          #limitGroup { display:flex; gap:12px; align-items:center; }
-          #limitGroup input { flex:2; }
-          #limitGroup select { flex:1; }
-          #createResult { margin-top:20px; padding:18px; background:#161616; border-radius:8px; border:1px solid #2a2a2a; word-break:break-all; }
+          form { background:linear-gradient(145deg,#1a1a1a,#262626); padding:30px; border-radius:12px; max-width:550px; border:1px solid #333; box-shadow:0 8px 24px rgba(0,0,0,0.5); }
+          form input, form select, form button { display:block; width:100%; padding:14px; margin:10px 0; border:none; border-radius:8px; background:#333; color:#eee; font-size:16px; transition:0.3s; }
+          form input:focus, form select:focus { outline:2px solid #666; background:#3a3a3a; }
+          form button { background:linear-gradient(135deg,#555,#777); cursor:pointer; font-weight:bold; letter-spacing:1px; }
+          form button:hover { background:linear-gradient(135deg,#666,#888); transform:scale(1.01); }
+          .limit-group { display:flex; gap:30px; margin:12px 0; }
+          .limit-group label { display:flex; align-items:center; gap:8px; color:#ccc; }
+          .limit-input-group { display:flex; gap:12px; align-items:center; }
+          .limit-input-group input { flex:2; }
+          .limit-input-group select { flex:1; }
+          #createResult { margin-top:20px; padding:16px; background:#1a1a1a; border-radius:8px; border:1px solid #444; word-break:break-all; }
+          #createResult a { color:#66ccff; text-decoration:underline; }
+          .toast { position:fixed; bottom:30px; right:30px; background:#222; color:#eee; padding:14px 24px; border-radius:10px; border-left:5px solid #4caf50; box-shadow:0 8px 24px rgba(0,0,0,0.6); animation:slideIn 0.5s ease; z-index:1000; }
+          @keyframes slideIn { from { transform:translateX(100px); opacity:0; } to { transform:translateX(0); opacity:1; } }
+          ::-webkit-scrollbar { width:6px; }
+          ::-webkit-scrollbar-track { background:#111; }
+          ::-webkit-scrollbar-thumb { background:#444; border-radius:10px; }
+          ::-webkit-scrollbar-thumb:hover { background:#666; }
           EOF
 
           cat > public/script.js << 'EOF'
           document.addEventListener('DOMContentLoaded', () => {
             const PASSWORD = 'mentalite11331352s';
-            const passwordInput = document.getElementById('password-input');
-            const loginBtn = document.getElementById('login-btn');
             const loginOverlay = document.getElementById('login-overlay');
             const app = document.getElementById('app');
+            const passwordInput = document.getElementById('password-input');
+            const loginBtn = document.getElementById('login-btn');
             const errorDiv = document.getElementById('login-error');
 
             function login() {
@@ -447,10 +476,13 @@ jobs:
             });
 
             const limitRadios = document.querySelectorAll('input[name="limitType"]');
-            const limitGroup = document.getElementById('limitGroup');
+            const limitInputGroup = document.querySelector('.limit-input-group');
             limitRadios.forEach(r => {
               r.addEventListener('change', () => {
-                limitGroup.style.display = r.value === 'limited' ? 'flex' : 'none';
+                limitInputGroup.style.display = r.value === 'limited' ? 'flex' : 'none';
+                if (r.value === 'unlimited') {
+                  document.getElementById('limitValue').value = '';
+                }
               });
             });
 
@@ -458,34 +490,58 @@ jobs:
               e.preventDefault();
               const name = document.getElementById('serverName').value.trim();
               const limitType = document.querySelector('input[name="limitType"]:checked').value;
-              let limit = 'unlimited', unit = 'GB';
+              let limit = 'unlimited';
+              let unit = 'GB';
               if (limitType === 'limited') {
-                limit = parseFloat(document.getElementById('limitValue').value);
+                const val = document.getElementById('limitValue').value;
+                if (!val || parseFloat(val) <= 0) {
+                  alert('Geçerli bir miktar girin');
+                  return;
+                }
+                limit = val;
                 unit = document.getElementById('limitUnit').value;
-                if (!limit || limit <= 0) { alert('Geçerli bir miktar girin'); return; }
               }
+              const payload = { name, limit, unit };
               const res = await fetch('/api/create', {
                 method: 'POST',
-                headers: { 'Content-Type':'application/json','x-password':PASSWORD },
-                body: JSON.stringify({ name, limit, unit })
+                headers: { 'Content-Type': 'application/json', 'x-password': PASSWORD },
+                body: JSON.stringify(payload)
               });
               const data = await res.json();
               const resultDiv = document.getElementById('createResult');
               if (data.success) {
                 const s = data.server;
-                resultDiv.innerHTML = `
-                  <i class="fas fa-check-circle" style="color:#4caf50;"></i> Server "${name}" oluşturuldu.<br>
-                  <strong>Port:</strong> ${s.port}<br>
-                  <strong>Limit:</strong> ${s.limit} ${s.limitUnit}<br>
-                  <strong>Tunnel URL:</strong> ${s.tunnelUrl || 'Hazırlanıyor...'}<br>
-                  <strong>VLESS:</strong> ${s.vlessUrl || 'Hazırlanıyor...'}
-                `;
+                let html = `<i class="fas fa-check-circle" style="color:#4caf50;"></i> Server "<strong>${s.name}</strong>" oluşturuldu.`;
+                html += `<br>Port: ${s.port}`;
+                html += `<br>Tunnel URL: <span id="tunnel-url-${s.name}">Hazırlanıyor...</span>`;
+                if (s.vlessUrl) {
+                  html += `<br>VLESS URL: <input type="text" value="${s.vlessUrl}" readonly style="width:100%;background:#333;border:none;color:#eee;padding:6px;border-radius:4px;" onclick="this.select();document.execCommand('copy');showToast('VLESS URL kopyalandı!');">`;
+                }
+                resultDiv.innerHTML = html;
                 document.getElementById('serverName').value = '';
                 document.getElementById('limitValue').value = '';
+                loadStatus();
               } else {
                 resultDiv.innerHTML = `<i class="fas fa-exclamation-triangle" style="color:#f44336;"></i> Hata: ${data.error}`;
               }
             });
+
+            window.showToast = (msg) => {
+              const toast = document.createElement('div');
+              toast.className = 'toast';
+              toast.textContent = msg;
+              document.body.appendChild(toast);
+              setTimeout(() => toast.remove(), 3000);
+            };
+
+            window.deleteServer = async (name) => {
+              if (!confirm(`"${name}" silinsin mi?`)) return;
+              const res = await fetch(`/api/delete/${name}`, {
+                method: 'DELETE',
+                headers: { 'x-password': PASSWORD }
+              });
+              if (res.ok) loadStatus();
+            };
 
             async function loadStatus() {
               try {
@@ -499,37 +555,41 @@ jobs:
 
                 const list = document.getElementById('serverList');
                 if (data.servers.length === 0) {
-                  list.innerHTML = '<p style="color:#666;">Henüz server yok. Create bölümünden ekleyin.</p>';
+                  list.innerHTML = '<p style="color:#666;text-align:center;padding:30px;">Henüz server yok. Create bölümünden ekleyin.</p>';
                   return;
                 }
-                list.innerHTML = data.servers.map(s => `
-                  <div class="server-item">
-                    <div class="info">
-                      <strong>${s.name}</strong>
-                      <span>Port: ${s.port}</span>
-                      <span>Limit: ${s.limit === 'unlimited' ? '∞' : s.limit + ' ' + s.limitUnit}</span>
-                      <span>Kullanım: ${(s.usage / 1024 / 1024).toFixed(2)} MB</span>
-                      <span>Kalan: ${s.remaining === '∞' ? '∞' : (s.remaining / 1024 / 1024).toFixed(2) + ' MB'}</span>
-                      <span class="status-indicator ${s.active ? 'active' : 'inactive'}"></span>
+                list.innerHTML = data.servers.map(s => {
+                  const limitDisplay = s.limit === 'unlimited' ? '∞' : `${(s.limit / (s.limitUnit === 'MB' ? 1024*1024 : 1024*1024*1024)).toFixed(1)} ${s.limitUnit}`;
+                  const usageDisplay = s.usage === 0 ? '0' : (s.usage / (s.limitUnit === 'MB' ? 1024*1024 : 1024*1024*1024)).toFixed(2);
+                  const remainingDisplay = s.remaining === '∞' ? '∞' : (s.remaining / (s.limitUnit === 'MB' ? 1024*1024 : 1024*1024*1024)).toFixed(2);
+                  return `
+                    <div class="server-item">
+                      <div class="info">
+                        <strong>${s.name}</strong>
+                        <span>Port: ${s.port}</span>
+                        <span>Limit: ${limitDisplay}</span>
+                        <span>Kullanım: ${usageDisplay} ${s.limitUnit === 'MB' ? 'MB' : 'GB'}</span>
+                        <span>Kalan: ${remainingDisplay} ${s.limitUnit === 'MB' ? 'MB' : 'GB'}</span>
+                        <span class="status-indicator ${s.active ? 'active' : 'inactive'}"></span>
+                      </div>
+                      <div class="actions">
+                        ${s.tunnelUrl ? `<a href="${s.tunnelUrl}" target="_blank" title="Tunnel URL"><i class="fas fa-external-link-alt"></i></a>` : ''}
+                        ${s.vlessUrl ? `<button onclick="navigator.clipboard.writeText('${s.vlessUrl}');showToast('VLESS URL kopyalandı!');" title="Kopyala VLESS"><i class="fas fa-copy"></i></button>` : ''}
+                        <button onclick="deleteServer('${s.name}')" title="Sil"><i class="fas fa-trash"></i></button>
+                      </div>
                     </div>
-                    <div class="actions">
-                      ${s.tunnelUrl ? `<a href="${s.tunnelUrl}" target="_blank" title="Tunnel URL"><i class="fas fa-external-link-alt"></i></a>` : ''}
-                      ${s.vlessUrl ? `<button onclick="navigator.clipboard.writeText('${s.vlessUrl}')" title="Kopyala VLESS"><i class="fas fa-copy"></i></button>` : ''}
-                      <button onclick="deleteServer('${s.name}')" title="Sil"><i class="fas fa-trash"></i></button>
-                    </div>
-                  </div>
-                `).join('');
+                  `;
+                }).join('');
+
+                // Create sonucunda gösterilen tunnel URL'lerini güncelle
+                data.servers.forEach(s => {
+                  const span = document.getElementById(`tunnel-url-${s.name}`);
+                  if (span && s.tunnelUrl && s.tunnelUrl !== 'pending') {
+                    span.innerHTML = `<a href="${s.tunnelUrl}" target="_blank">${s.tunnelUrl}</a>`;
+                  }
+                });
               } catch (e) { console.error(e); }
             }
-
-            window.deleteServer = async (name) => {
-              if (!confirm(`"${name}" silinsin mi?`)) return;
-              const res = await fetch(`/api/delete/${name}`, {
-                method: 'DELETE',
-                headers: { 'x-password': PASSWORD }
-              });
-              if (res.ok) loadStatus();
-            };
           });
           EOF
 
