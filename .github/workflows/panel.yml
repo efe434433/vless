@@ -1,0 +1,538 @@
+name: Mentalite Control Panel
+
+on:
+  workflow_dispatch:   # Manuel tetikleme
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 saat, isterseniz artırın
+
+    steps:
+      - name: Sistem paketlerini güncelle ve araçları kur
+        run: |
+          sudo apt update
+          sudo apt install -y curl wget unzip jq
+
+      - name: Node.js kurulumu
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Xray ve Cloudflared binary'lerini indir
+        run: |
+          # Xray
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip
+          chmod +x xray
+          sudo mv xray /usr/local/bin/
+          xray version
+
+          # Cloudflared
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Panel dosyalarını oluştur
+        run: |
+          mkdir -p panel/public
+          cd panel
+
+          # package.json
+          cat > package.json << 'EOF'
+          {
+            "name": "mentalite-panel",
+            "version": "1.0.0",
+            "main": "app.js",
+            "scripts": { "start": "node app.js" },
+            "dependencies": {
+              "express": "^4.18.2",
+              "body-parser": "^1.20.2",
+              "systeminformation": "^5.18.3",
+              "cors": "^2.8.5",
+              "fs-extra": "^11.1.1",
+              "uuid": "^9.0.0"
+            }
+          }
+          EOF
+
+          # app.js
+          cat > app.js << 'EOF'
+          const express = require('express');
+          const bodyParser = require('body-parser');
+          const cors = require('cors');
+          const fs = require('fs-extra');
+          const { spawn, exec } = require('child_process');
+          const path = require('path');
+          const si = require('systeminformation');
+          const { v4: uuidv4 } = require('uuid');
+
+          const app = express();
+          const PORT = 443;
+          const SERVERS_FILE = './servers.json';
+          const XRAY_CONFIG = '/tmp/xray-config.json';   // geçici, her seferinde yeniden yazılır
+          const LOG_DIR = './logs';
+
+          fs.ensureDirSync(LOG_DIR);
+          fs.ensureFileSync(SERVERS_FILE);
+
+          app.use(cors());
+          app.use(bodyParser.json());
+          app.use(express.static('public'));
+
+          // -------------------- HELPERS --------------------
+          function getServers() {
+            try { return fs.readJsonSync(SERVERS_FILE) || []; } catch { return []; }
+          }
+          function saveServers(servers) {
+            fs.writeJsonSync(SERVERS_FILE, servers, { spaces: 2 });
+          }
+          function getUsedPorts() {
+            return getServers().map(s => s.port);
+          }
+          function getRandomPort() {
+            let port;
+            let attempts = 0;
+            do {
+              port = Math.floor(Math.random() * 9000) + 1000;
+              attempts++;
+            } while (getUsedPorts().includes(port) && attempts < 100);
+            return port;
+          }
+
+          // Xray'ı yeniden başlat (config'i oluşturup process'i restart et)
+          let xrayProcess = null;
+          function restartXray(servers) {
+            // config oluştur
+            const inbounds = servers.map(s => ({
+              port: s.port,
+              protocol: 'vless',
+              settings: {
+                clients: [{ id: s.uuid, level: 0 }],
+                decryption: 'none'
+              },
+              streamSettings: {
+                network: 'ws',
+                wsSettings: { path: '/' }
+              },
+              sniffing: { enabled: true, destOverride: ['http', 'tls'] }
+            }));
+            // API inbound (stats için)
+            inbounds.push({
+              port: 10001,
+              protocol: 'dokodemo-door',
+              settings: { address: '127.0.0.1' },
+              tag: 'api'
+            });
+
+            const config = {
+              inbounds,
+              outbounds: [{ protocol: 'freedom' }],
+              stats: {},
+              policy: {
+                levels: { '0': { statsUserUplink: true, statsUserDownlink: true } }
+              },
+              api: { tag: 'api', services: ['StatsService'] }
+            };
+            fs.writeJsonSync(XRAY_CONFIG, config, { spaces: 2 });
+
+            // Eski process'i öldür
+            if (xrayProcess) {
+              try { process.kill(xrayProcess.pid); } catch(e) {}
+              xrayProcess = null;
+            }
+            // Yeni process başlat
+            const logFile = path.join(LOG_DIR, 'xray-api.log');
+            const out = fs.openSync(logFile, 'a');
+            const err = fs.openSync(logFile, 'a');
+            xrayProcess = spawn('xray', ['run', '-config', XRAY_CONFIG], {
+              detached: false,
+              stdio: ['ignore', out, err]
+            });
+            xrayProcess.on('error', (e) => console.error('Xray hatası:', e));
+            console.log('Xray başlatıldı, PID:', xrayProcess.pid);
+          }
+
+          // Her server için cloudflared tunnel başlat (ve URL'yi kaydet)
+          const tunnelProcesses = {};
+          function startTunnelForServer(server) {
+            const port = server.port;
+            const logFile = path.join(LOG_DIR, `tunnel-${port}.log`);
+            const out = fs.openSync(logFile, 'a');
+            const err = fs.openSync(logFile, 'a');
+            const proc = spawn('cloudflared', ['tunnel', '--url', `http://localhost:${port}`], {
+              detached: false,
+              stdio: ['ignore', out, err]
+            });
+            tunnelProcesses[port] = proc;
+            // URL'yi log'dan yakala (basitçe bir süre sonra oku)
+            setTimeout(() => {
+              try {
+                const log = fs.readFileSync(logFile, 'utf8');
+                const match = log.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+                if (match) {
+                  const url = match[0];
+                  // servers.json'ı güncelle
+                  const servers = getServers();
+                  const s = servers.find(srv => srv.port === port);
+                  if (s && !s.tunnelUrl) {
+                    s.tunnelUrl = url;
+                    s.vlessUrl = `vless://${s.uuid}@${url.replace(/^https?:\/\//, '')}:443?path=/&security=tls&encryption=none&host=${url.replace(/^https?:\/\//, '')}&type=ws#${encodeURIComponent(s.name)}`;
+                    saveServers(servers);
+                    console.log(`Tunnel URL kaydedildi: ${url} (${s.name})`);
+                  }
+                }
+              } catch(e) {}
+            }, 8000); // 8 sn bekle
+            return proc;
+          }
+
+          // Başlangıçta mevcut server'lar için tünelleri başlat
+          function initTunnels() {
+            const servers = getServers();
+            servers.forEach(s => {
+              if (s.tunnelUrl) return; // zaten var
+              startTunnelForServer(s);
+            });
+          }
+
+          // Stats API'den trafik çek
+          function fetchTraffic(server) {
+            return new Promise((resolve) => {
+              const uuid = server.uuid;
+              // Xray API'sine istek at
+              const cmd = `xray api stats --server=127.0.0.1:10001 -name "user>>>${uuid}>>>traffic>>>uplink" && xray api stats --server=127.0.0.1:10001 -name "user>>>${uuid}>>>traffic>>>downlink"`;
+              exec(cmd, (error, stdout, stderr) => {
+                if (error) { resolve({ uplink: 0, downlink: 0 }); return; }
+                const lines = stdout.split('\n');
+                let uplink = 0, downlink = 0;
+                for (const line of lines) {
+                  if (line.includes('uplink')) {
+                    const val = line.match(/\d+/);
+                    if (val) uplink = parseInt(val[0]);
+                  } else if (line.includes('downlink')) {
+                    const val = line.match(/\d+/);
+                    if (val) downlink = parseInt(val[0]);
+                  }
+                }
+                resolve({ uplink, downlink });
+              });
+            });
+          }
+
+          // -------------------- ROUTES --------------------
+          app.get('/api/status', async (req, res) => {
+            const cpu = await si.currentLoad();
+            const mem = await si.mem();
+            const servers = getServers();
+            // Trafik bilgilerini güncelle
+            for (const s of servers) {
+              const traffic = await fetchTraffic(s);
+              s.usage = traffic.uplink + traffic.downlink; // bytes cinsinden
+              // limit kontrolü (bytes)
+              if (s.limit !== 'unlimited' && s.usage > s.limit * 1024 * 1024 * 1024) {
+                // limit aşıldı, devre dışı bırak
+                s.active = false;
+              } else {
+                s.active = true;
+              }
+            }
+            saveServers(servers);
+            res.json({
+              cpu: cpu.currentLoad,
+              ram: mem.used / mem.total * 100,
+              totalServers: servers.length,
+              servers: servers.map(s => ({
+                name: s.name,
+                port: s.port,
+                limit: s.limit,
+                usage: s.usage || 0,
+                remaining: s.limit === 'unlimited' ? '∞' : Math.max(0, s.limit * 1024 * 1024 * 1024 - (s.usage || 0)),
+                active: s.active !== false,
+                tunnelUrl: s.tunnelUrl || 'pending',
+                vlessUrl: s.vlessUrl || ''
+              }))
+            });
+          });
+
+          app.post('/api/create', async (req, res) => {
+            const { name, limit } = req.body;
+            if (!name) return res.status(400).json({ error: 'İsim gerekli' });
+            if (getServers().some(s => s.name === name)) {
+              return res.status(400).json({ error: 'Bu isim zaten kullanılıyor' });
+            }
+            const port = getRandomPort();
+            const uuid = uuidv4();
+            const newServer = {
+              name,
+              port,
+              uuid,
+              limit: limit === 'unlimited' ? 'unlimited' : parseFloat(limit),
+              active: true,
+              tunnelUrl: null,
+              vlessUrl: null,
+              usage: 0
+            };
+            const servers = getServers();
+            servers.push(newServer);
+            saveServers(servers);
+
+            // Xray config'i güncelle ve restart
+            restartXray(servers);
+            // Tünel başlat
+            startTunnelForServer(newServer);
+
+            res.json({ success: true, server: newServer });
+          });
+
+          app.delete('/api/delete/:name', (req, res) => {
+            const name = req.params.name;
+            let servers = getServers();
+            const server = servers.find(s => s.name === name);
+            if (!server) return res.status(404).json({ error: 'Bulunamadı' });
+            // Tünel process'ini öldür
+            if (tunnelProcesses[server.port]) {
+              try { process.kill(tunnelProcesses[server.port].pid); } catch(e) {}
+              delete tunnelProcesses[server.port];
+            }
+            servers = servers.filter(s => s.name !== name);
+            saveServers(servers);
+            restartXray(servers);
+            res.json({ success: true });
+          });
+
+          // Başlat
+          const initialServers = getServers();
+          restartXray(initialServers);
+          initTunnels();
+
+          app.listen(PORT, '0.0.0.0', () => {
+            console.log(`Panel ${PORT} portunda çalışıyor.`);
+          });
+          EOF
+
+          # public/index.html
+          mkdir -p public
+          cat > public/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="tr">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Mentalite Control Panel</title>
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+            <link rel="stylesheet" href="style.css">
+          </head>
+          <body>
+            <div class="sidebar">
+              <div class="logo">Mentalite</div>
+              <ul class="menu">
+                <li class="active" data-section="monitor"><i class="fas fa-chart-line"></i> Monitor</li>
+                <li data-section="create"><i class="fas fa-plus-circle"></i> Create</li>
+              </ul>
+            </div>
+            <div class="main">
+              <div id="monitor" class="section active">
+                <h2><i class="fas fa-tachometer-alt"></i> Monitor</h2>
+                <div class="stats">
+                  <div class="stat-card"><i class="fas fa-microchip"></i> CPU <span id="cpu">0</span>%</div>
+                  <div class="stat-card"><i class="fas fa-memory"></i> RAM <span id="ram">0</span>%</div>
+                  <div class="stat-card"><i class="fas fa-server"></i> Servers <span id="serverCount">0</span></div>
+                </div>
+                <div id="serverList"></div>
+              </div>
+              <div id="create" class="section">
+                <h2><i class="fas fa-plus-circle"></i> Create Server</h2>
+                <form id="createForm">
+                  <input type="text" id="serverName" placeholder="Server Name" required>
+                  <div>
+                    <label><input type="radio" name="limitType" value="unlimited" checked> Unlimited</label>
+                    <label><input type="radio" name="limitType" value="gb"> GB Limit</label>
+                  </div>
+                  <input type="number" id="limitGb" placeholder="GB" disabled>
+                  <button type="submit"><i class="fas fa-rocket"></i> Create</button>
+                </form>
+                <div id="createResult"></div>
+              </div>
+            </div>
+            <script src="script.js"></script>
+          </body>
+          </html>
+          EOF
+
+          # public/style.css
+          cat > public/style.css << 'EOF'
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body { font-family: 'Segoe UI', sans-serif; background: #1a1a1a; color: #eee; display: flex; height: 100vh; }
+          .sidebar { width: 220px; background: #111; padding: 20px 0; border-right: 1px solid #333; display: flex; flex-direction: column; }
+          .logo { font-size: 22px; font-weight: bold; padding: 0 20px 30px; letter-spacing: 2px; color: #fff; }
+          .menu { list-style: none; flex: 1; }
+          .menu li { padding: 14px 20px; cursor: pointer; border-left: 3px solid transparent; transition: 0.2s; display: flex; align-items: center; gap: 12px; }
+          .menu li i { width: 20px; }
+          .menu li:hover { background: #222; }
+          .menu li.active { background: #222; border-left-color: #fff; color: #fff; }
+          .main { flex: 1; padding: 30px; overflow-y: auto; }
+          .section { display: none; animation: fade 0.3s; }
+          .section.active { display: block; }
+          @keyframes fade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+          h2 { font-weight: 300; font-size: 24px; margin-bottom: 25px; border-bottom: 1px solid #333; padding-bottom: 10px; }
+          .stats { display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap; }
+          .stat-card { background: #222; padding: 20px 30px; border-radius: 8px; flex: 1; min-width: 120px; border: 1px solid #333; }
+          .stat-card i { margin-right: 10px; color: #aaa; }
+          .stat-card span { font-weight: bold; font-size: 22px; display: block; margin-top: 5px; }
+          #serverList { display: flex; flex-direction: column; gap: 12px; }
+          .server-item { background: #222; padding: 15px 20px; border-radius: 6px; border-left: 4px solid #555; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+          .server-item .info { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+          .server-item .info span { background: #333; padding: 2px 10px; border-radius: 12px; font-size: 13px; }
+          .server-item .actions button { background: none; border: none; color: #eee; cursor: pointer; margin-left: 10px; }
+          .server-item .actions button:hover { color: #ff6b6b; }
+          .server-item .status { display: flex; align-items: center; gap: 12px; }
+          .status-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+          .status-indicator.active { background: #4caf50; }
+          .status-indicator.inactive { background: #f44336; }
+          form { background: #222; padding: 25px; border-radius: 8px; max-width: 500px; border: 1px solid #333; }
+          form input, form button { display: block; width: 100%; padding: 12px; margin: 12px 0; border: none; border-radius: 4px; background: #333; color: #eee; font-size: 16px; }
+          form button { background: #444; cursor: pointer; transition: 0.2s; font-weight: bold; }
+          form button:hover { background: #555; }
+          form div { display: flex; gap: 20px; align-items: center; margin: 10px 0; }
+          form label { display: flex; align-items: center; gap: 6px; color: #ccc; }
+          input:disabled { opacity: 0.5; }
+          #createResult { margin-top: 20px; padding: 15px; background: #222; border-radius: 4px; border: 1px solid #444; }
+          EOF
+
+          # public/script.js
+          cat > public/script.js << 'EOF'
+          document.addEventListener('DOMContentLoaded', () => {
+            // Menu switching
+            document.querySelectorAll('.menu li').forEach(item => {
+              item.addEventListener('click', () => {
+                document.querySelectorAll('.menu li').forEach(l => l.classList.remove('active'));
+                item.classList.add('active');
+                const section = item.dataset.section;
+                document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+                document.getElementById(section).classList.add('active');
+              });
+            });
+
+            // Limit type toggle
+            const limitTypeRadios = document.querySelectorAll('input[name="limitType"]');
+            const limitGbInput = document.getElementById('limitGb');
+            limitTypeRadios.forEach(r => {
+              r.addEventListener('change', () => {
+                limitGbInput.disabled = r.value !== 'gb';
+                if (r.value === 'gb') limitGbInput.focus();
+              });
+            });
+
+            // Create form
+            document.getElementById('createForm').addEventListener('submit', async (e) => {
+              e.preventDefault();
+              const name = document.getElementById('serverName').value.trim();
+              const limitType = document.querySelector('input[name="limitType"]:checked').value;
+              let limit = 'unlimited';
+              if (limitType === 'gb') {
+                limit = parseFloat(document.getElementById('limitGb').value);
+                if (!limit || limit <= 0) { alert('Geçerli bir GB değeri girin'); return; }
+              }
+              const res = await fetch('/api/create', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, limit })
+              });
+              const data = await res.json();
+              if (data.success) {
+                document.getElementById('createResult').innerHTML = `<i class="fas fa-check-circle" style="color:#4caf50;"></i> Server "${name}" oluşturuldu. Port: ${data.server.port}`;
+                document.getElementById('serverName').value = '';
+                document.getElementById('limitGb').value = '';
+                loadStatus();
+              } else {
+                document.getElementById('createResult').innerHTML = `<i class="fas fa-exclamation-triangle" style="color:#f44336;"></i> Hata: ${data.error}`;
+              }
+            });
+
+            // Load status
+            async function loadStatus() {
+              try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                document.getElementById('cpu').textContent = data.cpu.toFixed(1);
+                document.getElementById('ram').textContent = data.ram.toFixed(1);
+                document.getElementById('serverCount').textContent = data.totalServers;
+
+                const list = document.getElementById('serverList');
+                if (data.servers.length === 0) {
+                  list.innerHTML = '<p style="color:#666;">Henüz server yok. Create bölümünden ekleyin.</p>';
+                  return;
+                }
+                list.innerHTML = data.servers.map(s => `
+                  <div class="server-item">
+                    <div class="info">
+                      <strong>${s.name}</strong>
+                      <span>Port: ${s.port}</span>
+                      <span>Limit: ${s.limit === 'unlimited' ? '∞' : s.limit + ' GB'}</span>
+                      <span>Kullanım: ${(s.usage / 1024 / 1024 / 1024).toFixed(2)} GB</span>
+                      <span>Kalan: ${s.remaining === '∞' ? '∞' : (s.remaining / 1024 / 1024 / 1024).toFixed(2) + ' GB'}</span>
+                      <span class="status-indicator ${s.active ? 'active' : 'inactive'}"></span>
+                    </div>
+                    <div class="actions">
+                      ${s.tunnelUrl ? `<a href="${s.tunnelUrl}" target="_blank" title="Tunnel URL"><i class="fas fa-external-link-alt"></i></a>` : ''}
+                      ${s.vlessUrl ? `<button onclick="navigator.clipboard.writeText('${s.vlessUrl}')" title="Kopyala VLESS"><i class="fas fa-copy"></i></button>` : ''}
+                      <button onclick="deleteServer('${s.name}')" title="Sil"><i class="fas fa-trash"></i></button>
+                    </div>
+                  </div>
+                `).join('');
+              } catch (e) { console.error(e); }
+            }
+
+            window.deleteServer = async (name) => {
+              if (!confirm(`"${name}" silinsin mi?`)) return;
+              const res = await fetch(`/api/delete/${name}`, { method: 'DELETE' });
+              if (res.ok) loadStatus();
+            };
+
+            loadStatus();
+            setInterval(loadStatus, 10000);
+          });
+          EOF
+
+          # .env (opsiyonel) boş bırak
+          echo "PORT=443" > .env
+
+          cd ..
+
+      - name: NPM bağımlılıklarını yükle
+        run: |
+          cd panel
+          npm install
+
+      - name: Paneli başlat (443 portu)
+        run: |
+          cd panel
+          # sudo ile çalıştır (443 için)
+          nohup sudo node app.js > panel.log 2>&1 &
+          sleep 5
+          echo "Panel başlatıldı."
+
+      - name: Cloudflared tüneli ile paneli dışa aç
+        run: |
+          # Panel 443'te çalışıyor, onu tünelle
+          nohup cloudflared tunnel --url http://localhost:443 > tunnel-panel.log 2>&1 &
+          sleep 12
+          # URL'yi yakala
+          TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' tunnel-panel.log | head -1)
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Tunnel URL alınamadı, loglar:"
+            cat tunnel-panel.log
+            exit 1
+          fi
+          echo "=========================================="
+          echo "✅ Panel erişim URL'si: $TUNNEL_URL"
+          echo "=========================================="
+          # URL'i iş akışı çıktısına yaz
+          echo "PANEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+
+      - name: İş akışını canlı tut (sonsuz döngü)
+        run: |
+          echo "Panel çalışıyor. Durdurmak için iş akışını iptal edin."
+          while true; do sleep 3600; done
